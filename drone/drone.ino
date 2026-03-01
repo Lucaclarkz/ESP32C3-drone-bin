@@ -1,347 +1,411 @@
+/*
+  LiteWing-App Compatible (CRTP over UDP) - ESP32-C3 SuperMini Plus + MPU6050 Brushed Quad
+  Pins (as you said):
+    M1 GPIO21 Front Left
+    M2 GPIO20 Front Right
+    M3 GPIO10 Back Right
+    M4 GPIO5  Back Left
+    MPU6050: SCL GPIO6, SDA GPIO7
+    LED: GPIO8  (Power-on blink, WiFi-ready solid)
+
+  Protocol:
+    - LiteWing app is based on Crazyflie/CRTP.  (CircuitDigest)
+    - UDP packet: CRTP bytes + 1-byte checksum (sum mod 256). (ESP-Drone docs)
+*/
+
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <math.h>
 
-// ===== WiFi SoftAP =====
-static const char* AP_SSID = "C3-DRONE";
+// =================== USER CONFIG ===================
+static const int PIN_M1 = 21;   // FL
+static const int PIN_M2 = 20;   // FR
+static const int PIN_M3 = 10;   // BR
+static const int PIN_M4 = 5;    // BL
+
+static const int I2C_SCL = 6;
+static const int I2C_SDA = 7;
+
+static const int PIN_LED = 8;
+
+// SSID format LiteWing_xxxxxxxxxxxx, password 12345678
 static const char* AP_PASS = "12345678";
 
-// ===== Pins (NO CHANGE) =====
-static const int PIN_M1 = 21;   // Front Left
-static const int PIN_M2 = 20;   // Front Right
-static const int PIN_M3 = 2;    // Rear Right
-static const int PIN_M4 = 3;    // Rear Left
-static const int I2C_SDA = 7;
-static const int I2C_SCL = 6;
+// Many LiteWing/ESP-Drone examples use 192.168.43.42
+static const IPAddress AP_IP(192,168,43,42);
+static const IPAddress AP_GW(192,168,43,42);
+static const IPAddress AP_MASK(255,255,255,0);
 
-// ===== Status LED =====
-static const int STATUS_LED = 8;  // ESP32-C3 SuperMini onboard LED (GPIO8)
+// UDP ports (common CRTP WiFi control)
+static const uint16_t UDP_RX_PORT = 2390; // app -> drone
+static const uint16_t UDP_TX_PORT = 2399; // optional
 
-// ===== PWM =====
+// =================== PWM (Brushed) ===================
 static const int PWM_FREQ = 20000;
 static const int PWM_RES_BITS = 8;
 static const int PWM_MAX = (1 << PWM_RES_BITS) - 1;
-static const int CH_M1 = 0, CH_M2 = 1, CH_M3 = 2, CH_M4 = 3;
 
-// Coreless tune
+static const int CH_M1 = 0;
+static const int CH_M2 = 1;
+static const int CH_M3 = 2;
+static const int CH_M4 = 3;
+
 static const int MOTOR_MIN_START = 35;
 static const int MOTOR_MAX_LIMIT = 240;
-static const int THR_RAMP_PER_LOOP = 3;
+static const int THR_RAMP_STEP   = 3;
 
-// Loop
+// =================== CONTROL LOOP ===================
 static const float LOOP_HZ = 250.0f;
 static const uint32_t LOOP_US = (uint32_t)(1000000.0f / LOOP_HZ);
 
-// Filter / Expo
 static const float CF_ALPHA = 0.98f;
-static const float EXPO = 0.35f;
 
-// Safety timeouts (more stable than 350ms)
-static const uint32_t CMD_TIMEOUT_MS = 1000;      // throttle cut if no packets
-static const uint32_t DISARM_TIMEOUT_MS = 6000;   // auto disarm if no packets
+// failsafe
+static const uint32_t FAILSAFE_MS = 350;
 
+// =================== MODES ===================
 enum FlightMode { MODE_ANGLE = 0, MODE_RATE = 1 };
+static FlightMode mode = MODE_ANGLE;
 
-// PID (start point)
+// =================== PID (START VALUES, tune later) ===================
+// Angle outer loop: angle error -> desired rate
 static float Kp_angle = 4.5f;
 
+// Rate PID (deg/s)
 static float Kp_rate_rp = 0.09f;
 static float Ki_rate_rp = 0.18f;
 static float Kd_rate_rp = 0.0025f;
 
-static float Kp_rate_y = 0.12f;
-static float Ki_rate_y = 0.10f;
-static float Kd_rate_y = 0.0f;
+static float Kp_rate_y  = 0.12f;
+static float Ki_rate_y  = 0.10f;
+static float Kd_rate_y  = 0.0f;
 
 static const float MAX_ANGLE_DEG = 30.0f;
-static const float MAX_RATE_RP = 220.0f;
-static const float MAX_RATE_Y  = 180.0f;
+static const float MAX_RATE_RP   = 220.0f;
+static const float MAX_RATE_Y    = 180.0f;
 
-// ===== Globals =====
+// =================== GLOBALS ===================
 Adafruit_MPU6050 mpu;
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+WiFiUDP udp;
 
-volatile bool armed = false;
-volatile bool killSwitch = false;
-volatile FlightMode mode = MODE_ANGLE;
-volatile uint32_t lastCmdMs = 0;
-
-// Inputs
-volatile float in_throttle = 0.0f;  // 0..1
-volatile float in_roll = 0.0f;      // -1..1
-volatile float in_pitch = 0.0f;     // -1..1
-volatile float in_yaw = 0.0f;       // -1..1
-volatile float in_thrLimit = 1.0f;  // 0.2..1
-
-// State
+// attitude (deg)
 static float roll_deg = 0, pitch_deg = 0;
-static float gyro_bias_x = 0, gyro_bias_y = 0, gyro_bias_z = 0;
 
-// PID
-static float i_roll = 0, i_pitch = 0, i_yaw = 0;
-static float last_err_r = 0, last_err_p = 0, last_err_y = 0;
+// gyro bias (rad/s)
+static float gbx=0, gby=0, gbz=0;
 
-// Throttle smoothing
-static int thr_duty_smooth = 0;
+// rate PID integrators
+static float i_r=0, i_p=0, i_y=0;
+static float prev_er=0, prev_ep=0, prev_ey=0;
 
-// ===== Utils =====
-static inline float clampf(float x, float a, float b) { return (x < a) ? a : (x > b) ? b : x; }
-static inline float expoCurve(float x, float expo) {
-  float ax = fabsf(x);
-  float y = (1.0f - expo) * x + expo * x * ax * ax;
-  return clampf(y, -1.0f, 1.0f);
-}
-static void motorWrite(int ch, int duty) { ledcWrite(ch, constrain(duty, 0, PWM_MAX)); }
-static void allMotorsOff() { motorWrite(CH_M1,0); motorWrite(CH_M2,0); motorWrite(CH_M3,0); motorWrite(CH_M4,0); }
+// throttle smoothing
+static int thr_smooth = 0;
 
-// ===== Status LED =====
-static void updateStatusLED() {
-  // blink while no station connected to SoftAP, solid ON when connected
-  if (WiFi.softAPgetStationNum() > 0) {
-    digitalWrite(STATUS_LED, HIGH);
-  } else {
-    static uint32_t t = 0;
-    static bool s = false;
-    if (millis() - t > 250) {
-      t = millis();
-      s = !s;
-      digitalWrite(STATUS_LED, s ? HIGH : LOW);
-    }
-  }
+// command from app
+static volatile float cmd_roll = 0;     // deg (ANGLE) or rate fraction (RATE) depending mode below
+static volatile float cmd_pitch = 0;
+static volatile float cmd_yawrate = 0;  // deg/s
+static volatile float cmd_thrust = 0;   // 0..1
+
+static volatile uint32_t lastPktMs = 0;
+
+// arming logic (simple)
+static bool armed = false;
+static uint32_t zeroThrStartMs = 0;
+
+// LED
+static void ledBlinkBoot() {
+  static uint32_t last=0; static bool s=false;
+  if (millis() - last >= 350) { last = millis(); s = !s; digitalWrite(PIN_LED, s); }
 }
 
-// ===== Calibration =====
-static void resetPid() {
-  i_roll = i_pitch = i_yaw = 0;
-  last_err_r = last_err_p = last_err_y = 0;
+// =================== UTILS ===================
+static inline float clampf(float x, float a, float b){ return (x<a)?a:(x>b)?b:x; }
+
+static inline uint8_t cksum_sum_mod256(const uint8_t* data, size_t n){
+  uint32_t s=0; for(size_t i=0;i<n;i++) s+=data[i]; return (uint8_t)(s & 0xFF);
 }
-static void calibrateGyro(uint16_t samples = 800) {
-  float sx = 0, sy = 0, sz = 0;
-  sensors_event_t a, g, t;
-  for (uint16_t i = 0; i < samples; i++) {
-    mpu.getEvent(&a, &g, &t);
+
+static inline uint8_t crtp_port(uint8_t h){ return (h >> 4) & 0x0F; }
+static inline uint8_t crtp_chan(uint8_t h){ return h & 0x03; }
+
+static void motorWrite(int ch, int duty){
+  duty = constrain(duty, 0, PWM_MAX);
+  ledcWrite(ch, duty);
+}
+
+static void motorsOff(){
+  motorWrite(CH_M1,0); motorWrite(CH_M2,0); motorWrite(CH_M3,0); motorWrite(CH_M4,0);
+}
+
+// =================== IMU CAL ===================
+static void calibrateGyro(uint16_t samples=900){
+  float sx=0, sy=0, sz=0;
+  sensors_event_t a,g,t;
+  for(uint16_t i=0;i<samples;i++){
+    mpu.getEvent(&a,&g,&t);
     sx += g.gyro.x; sy += g.gyro.y; sz += g.gyro.z;
     delay(2);
   }
-  gyro_bias_x = sx / samples;
-  gyro_bias_y = sy / samples;
-  gyro_bias_z = sz / samples;
-  resetPid();
+  gbx = sx/samples; gby = sy/samples; gbz = sz/samples;
+
+  roll_deg = 0; pitch_deg = 0;
+  i_r=i_p=i_y=0; prev_er=prev_ep=prev_ey=0;
+  thr_smooth = 0;
 }
 
-// ===== Mini page (optional) =====
-static const char mini_html[] PROGMEM =
-  "<!doctype html><html><body style='font-family:sans-serif'>"
-  "<h3>C3 DRONE</h3><p>Use ESP-Drone II app. WS endpoint: <b>/ws</b></p>"
-  "</body></html>";
+// =================== CRTP SETPOINT PARSE ===================
+// Expect Commander setpoint: port=3, chan=0
+// payload: float roll, float pitch, float yawrate, uint16 thrust
+static bool handlePacket(const uint8_t* buf, size_t len){
+  if(len < 2) return false;
+  uint8_t rx = buf[len-1];
+  uint8_t calc = cksum_sum_mod256(buf, len-1);
+  if(rx != calc) return false;
 
-// ===== WebSocket Handler (ESP-Drone II protocol) =====
-static void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c,
-                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
-  if (type != WS_EVT_DATA || len == 0) return;
+  uint8_t h = buf[0];
+  uint8_t port = crtp_port(h);
+  uint8_t chan = crtp_chan(h);
 
-  String msg; msg.reserve(len + 1);
-  for (size_t i = 0; i < len; i++) msg += (char)data[i];
-  lastCmdMs = millis();
+  if(port==3 && chan==0){
+    if(len < (1 + 4 + 4 + 4 + 2 + 1)) return false;
+    float r,p,y; uint16_t t16;
+    memcpy(&r,   &buf[1], 4);
+    memcpy(&p,   &buf[5], 4);
+    memcpy(&y,   &buf[9], 4);
+    memcpy(&t16, &buf[13],2);
 
-  if (msg == "ARM")    { killSwitch=false; armed=true;  resetPid(); thr_duty_smooth=0; c->text("ARMED"); return; }
-  if (msg == "DISARM") { armed=false; c->text("DISARMED"); return; }
-  if (msg == "KILL1")  { killSwitch=true; armed=false; c->text("KILL ON"); return; }
-  if (msg == "KILL0")  { killSwitch=false; c->text("KILL OFF"); return; }
-  if (msg == "MODE0")  { mode=MODE_ANGLE; c->text("MODE ANGLE"); return; }
-  if (msg == "MODE1")  { mode=MODE_RATE;  c->text("MODE RATE");  return; }
-  if (msg == "CAL")    { armed=false; c->text("CAL..."); calibrateGyro(); c->text("CAL OK"); return; }
+    cmd_roll = r;
+    cmd_pitch = p;
+    cmd_yawrate = y;
+    cmd_thrust = clampf((float)t16 / 65535.0f, 0.0f, 1.0f);
 
-  // Control: C:throttle,roll,pitch,yaw,limit   (0..1000, -1000..1000, 0..1000)
-  if (msg.startsWith("C:")) {
-    int t, r, p, y, lim;
-    if (sscanf(msg.c_str(), "C:%d,%d,%d,%d,%d", &t, &r, &p, &y, &lim) == 5) {
-      float thr = clampf(t / 1000.0f, 0.0f, 1.0f);
-      float rr  = clampf(r / 1000.0f, -1.0f, 1.0f);
-      float pp  = clampf(p / 1000.0f, -1.0f, 1.0f);
-      float yy  = clampf(y / 1000.0f, -1.0f, 1.0f);
-      float ll  = clampf(lim / 1000.0f, 0.2f, 1.0f);
-
-      in_throttle = thr;
-      in_roll  = expoCurve(rr, EXPO);
-      in_pitch = expoCurve(pp, EXPO);
-      in_yaw   = expoCurve(yy, EXPO);
-      in_thrLimit = ll;
-    }
+    lastPktMs = millis();
+    return true;
   }
+
+  return false;
 }
 
-void setup() {
+static void udpPoll(){
+  int n = udp.parsePacket();
+  if(n <= 0) return;
+  uint8_t buf[64];
+  int r = udp.read(buf, (int)sizeof(buf));
+  if(r > 0) handlePacket(buf, (size_t)r);
+}
+
+// =================== WIFI/AP ===================
+static void makeSSID(char* out, size_t outlen){
+  // "LiteWing_" + MAC without ':'
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(out, outlen, "LiteWing_%02X%02X%02X%02X%02X%02X",
+           mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+}
+
+// =================== SETUP ===================
+void setup(){
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+
   Serial.begin(115200);
-  delay(50);
+  delay(120);
 
-  pinMode(STATUS_LED, OUTPUT);
-  digitalWrite(STATUS_LED, LOW);
-
+  // IMU
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
 
-  if (!mpu.begin()) { while (1) delay(100); }
+  if(!mpu.begin()){
+    while(1){ ledBlinkBoot(); delay(5); }
+  }
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
+  // PWM
   ledcSetup(CH_M1, PWM_FREQ, PWM_RES_BITS);
   ledcSetup(CH_M2, PWM_FREQ, PWM_RES_BITS);
   ledcSetup(CH_M3, PWM_FREQ, PWM_RES_BITS);
   ledcSetup(CH_M4, PWM_FREQ, PWM_RES_BITS);
+
   ledcAttachPin(PIN_M1, CH_M1);
   ledcAttachPin(PIN_M2, CH_M2);
   ledcAttachPin(PIN_M3, CH_M3);
   ledcAttachPin(PIN_M4, CH_M4);
-  allMotorsOff();
+  motorsOff();
 
+  // WiFi AP
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
 
-  ws.onEvent(onWsEvent);
-  server.addHandler(&ws);
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){ req->send_P(200, "text/html", mini_html); });
-  server.begin();
+  char ssid[40];
+  makeSSID(ssid, sizeof(ssid));
+  WiFi.softAP(ssid, AP_PASS);
 
-  delay(400);
-  calibrateGyro();         // keep still at boot
-  lastCmdMs = millis();
+  udp.begin(UDP_RX_PORT);
+
+  // Boot blink during calibration
+  uint32_t t0 = millis();
+  while(millis()-t0 < 500){ ledBlinkBoot(); delay(5); }
+  calibrateGyro();
+
+  // WiFi ready => solid ON
+  digitalWrite(PIN_LED, HIGH);
+
+  lastPktMs = millis();
+
+  Serial.print("SSID: "); Serial.println(ssid);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+  Serial.printf("UDP RX: %u\n", UDP_RX_PORT);
 }
 
-void loop() {
-  ws.cleanupClients();
-  updateStatusLED();
+// =================== MAIN LOOP ===================
+void loop(){
+  // receive UDP packets as fast as possible
+  udpPoll();
 
-  const uint32_t nowMs = millis();
-
-  // Failsafe
-  if (armed && (nowMs - lastCmdMs > CMD_TIMEOUT_MS)) {
-    in_throttle = 0.0f; in_roll = 0.0f; in_pitch = 0.0f; in_yaw = 0.0f;
-  }
-  if (armed && (nowMs - lastCmdMs > DISARM_TIMEOUT_MS)) {
+  // failsafe
+  uint32_t nowMs = millis();
+  if(nowMs - lastPktMs > FAILSAFE_MS){
     armed = false;
+    motorsOff();
+    return;
   }
-  if (killSwitch) armed = false;
 
+  // simple arm logic:
+  // - arm when we get thrust > 0.08
+  // - disarm if thrust stays near 0 for > 1s
+  float thr = cmd_thrust;
+
+  if(!armed){
+    if(thr > 0.08f){
+      armed = true;
+      i_r=i_p=i_y=0; prev_er=prev_ep=prev_ey=0;
+      thr_smooth = 0;
+      zeroThrStartMs = 0;
+    }else{
+      motorsOff();
+      return;
+    }
+  }else{
+    if(thr < 0.02f){
+      if(zeroThrStartMs==0) zeroThrStartMs = nowMs;
+      if(nowMs - zeroThrStartMs > 1000){
+        armed = false;
+        motorsOff();
+        return;
+      }
+    }else{
+      zeroThrStartMs = 0;
+    }
+  }
+
+  // fixed-rate control
   static uint32_t lastUs = micros();
-  const uint32_t nowUs = micros();
-  if ((uint32_t)(nowUs - lastUs) < LOOP_US) return;
-
+  uint32_t nowUs = micros();
+  if((uint32_t)(nowUs - lastUs) < LOOP_US) return;
   float dt = (nowUs - lastUs) / 1000000.0f;
   lastUs = nowUs;
-  if (dt < 0.002f) dt = 0.002f;
-  if (dt > 0.02f)  dt = 0.02f;
+  if(dt <= 0) dt = 0.004f;
 
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  sensors_event_t a,g,t;
+  mpu.getEvent(&a,&g,&t);
 
-  // Gyro (deg/s) bias removed
-  float gx = (g.gyro.x - gyro_bias_x) * 180.0f / PI;
-  float gy = (g.gyro.y - gyro_bias_y) * 180.0f / PI;
-  float gz = (g.gyro.z - gyro_bias_z) * 180.0f / PI;
+  // gyro deg/s with bias removed
+  float gx = (g.gyro.x - gbx) * 180.0f / PI;
+  float gy = (g.gyro.y - gby) * 180.0f / PI;
+  float gz = (g.gyro.z - gbz) * 180.0f / PI;
 
-  // Acc angles
+  // accel angles deg
   float accRoll  = atan2f(a.acceleration.y, a.acceleration.z) * 180.0f / PI;
   float accPitch = atan2f(-a.acceleration.x,
                           sqrtf(a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z)) * 180.0f / PI;
 
-  // Complementary
-  roll_deg  = CF_ALPHA * (roll_deg  + gx * dt) + (1.0f - CF_ALPHA) * accRoll;
-  pitch_deg = CF_ALPHA * (pitch_deg + gy * dt) + (1.0f - CF_ALPHA) * accPitch;
+  // complementary filter
+  roll_deg  = CF_ALPHA*(roll_deg  + gx*dt) + (1.0f-CF_ALPHA)*accRoll;
+  pitch_deg = CF_ALPHA*(pitch_deg + gy*dt) + (1.0f-CF_ALPHA)*accPitch;
 
-  // Desired rates
-  float des_rate_roll = 0, des_rate_pitch = 0, des_rate_yaw = 0;
+  // desired rates
+  float des_r=0, des_p=0, des_y=0;
 
-  if (mode == MODE_ANGLE) {
-    float des_ang_roll  = in_roll  * MAX_ANGLE_DEG;
-    float des_ang_pitch = in_pitch * MAX_ANGLE_DEG;
-    des_rate_roll  = clampf((des_ang_roll  - roll_deg)  * Kp_angle, -MAX_RATE_RP, MAX_RATE_RP);
-    des_rate_pitch = clampf((des_ang_pitch - pitch_deg) * Kp_angle, -MAX_RATE_RP, MAX_RATE_RP);
-  } else {
-    des_rate_roll  = in_roll  * MAX_RATE_RP;
-    des_rate_pitch = in_pitch * MAX_RATE_RP;
+  if(mode == MODE_ANGLE){
+    float desAngR = clampf(cmd_roll,  -MAX_ANGLE_DEG, MAX_ANGLE_DEG);
+    float desAngP = clampf(cmd_pitch, -MAX_ANGLE_DEG, MAX_ANGLE_DEG);
+    des_r = clampf((desAngR - roll_deg ) * Kp_angle, -MAX_RATE_RP, MAX_RATE_RP);
+    des_p = clampf((desAngP - pitch_deg) * Kp_angle, -MAX_RATE_RP, MAX_RATE_RP);
+  }else{
+    // If you switch to RATE mode later: interpret cmd_roll/cmd_pitch as deg/s directly
+    des_r = clampf(cmd_roll,  -MAX_RATE_RP, MAX_RATE_RP);
+    des_p = clampf(cmd_pitch, -MAX_RATE_RP, MAX_RATE_RP);
   }
-  des_rate_yaw = in_yaw * MAX_RATE_Y;
+  des_y = clampf(cmd_yawrate, -MAX_RATE_Y, MAX_RATE_Y);
 
   // Rate PID Roll
-  float err_r = des_rate_roll - gx;
-  i_roll = clampf(i_roll + err_r * dt, -200.0f, 200.0f);
-  float d_r = (err_r - last_err_r) / dt; last_err_r = err_r;
-  float out_r = Kp_rate_rp * err_r + Ki_rate_rp * i_roll + Kd_rate_rp * d_r;
+  float er = des_r - gx;
+  i_r = clampf(i_r + er*dt, -200.0f, 200.0f);
+  float dr = (er - prev_er)/dt; prev_er = er;
+  float out_r = Kp_rate_rp*er + Ki_rate_rp*i_r + Kd_rate_rp*dr;
 
   // Rate PID Pitch
-  float err_p = des_rate_pitch - gy;
-  i_pitch = clampf(i_pitch + err_p * dt, -200.0f, 200.0f);
-  float d_p = (err_p - last_err_p) / dt; last_err_p = err_p;
-  float out_p = Kp_rate_rp * err_p + Ki_rate_rp * i_pitch + Kd_rate_rp * d_p;
+  float ep = des_p - gy;
+  i_p = clampf(i_p + ep*dt, -200.0f, 200.0f);
+  float dp = (ep - prev_ep)/dt; prev_ep = ep;
+  float out_p = Kp_rate_rp*ep + Ki_rate_rp*i_p + Kd_rate_rp*dp;
 
   // Rate PID Yaw
-  float err_y = des_rate_yaw - gz;
-  i_yaw = clampf(i_yaw + err_y * dt, -200.0f, 200.0f);
-  float d_y = (err_y - last_err_y) / dt; last_err_y = err_y;
-  float out_y = Kp_rate_y * err_y + Ki_rate_y * i_yaw + Kd_rate_y * d_y;
+  float ey = des_y - gz;
+  i_y = clampf(i_y + ey*dt, -200.0f, 200.0f);
+  float dy = (ey - prev_ey)/dt; prev_ey = ey;
+  float out_y = Kp_rate_y*ey + Ki_rate_y*i_y + Kd_rate_y*dy;
 
-  // Throttle -> duty
-  float thr = clampf(in_throttle, 0.0f, 1.0f) * clampf(in_thrLimit, 0.2f, 1.0f);
-
-  int targetDuty = 0;
-  if (armed && thr > 0.001f) {
+  // Thrust -> base PWM duty
+  int target = 0;
+  if(thr > 0.01f){
     int usable = MOTOR_MAX_LIMIT - MOTOR_MIN_START;
-    targetDuty = MOTOR_MIN_START + (int)(thr * usable);
-  } else {
-    targetDuty = 0;
+    target = MOTOR_MIN_START + (int)(thr * usable);
+  }else{
+    target = 0;
   }
 
-  // Ramp throttle
-  if (targetDuty > thr_duty_smooth) thr_duty_smooth = min(targetDuty, thr_duty_smooth + THR_RAMP_PER_LOOP);
-  else                              thr_duty_smooth = max(targetDuty, thr_duty_smooth - THR_RAMP_PER_LOOP);
+  // throttle ramp
+  if(target > thr_smooth) thr_smooth = min(target, thr_smooth + THR_RAMP_STEP);
+  else                   thr_smooth = max(target, thr_smooth - THR_RAMP_STEP);
 
-  float base = (float)thr_duty_smooth;
+  float base = (float)thr_smooth;
 
-  const float yawSign = 1.0f; // if yaw reversed, set -1.0f
+  // If yaw feels reversed, set yawSign = -1
+  const float yawSign = 1.0f;
   float yawTerm = yawSign * out_y;
 
-  // X-mix (M1 FL, M2 FR, M3 RR, M4 RL)
+  // X mix: M1 FL, M2 FR, M3 BR, M4 BL
   float m1 = base - out_p + out_r - yawTerm;
   float m2 = base - out_p - out_r + yawTerm;
   float m3 = base + out_p - out_r - yawTerm;
   float m4 = base + out_p + out_r + yawTerm;
 
-  // Headroom clamp
-  float maxOut = fmaxf(fmaxf(m1, m2), fmaxf(m3, m4));
-  if (maxOut > MOTOR_MAX_LIMIT) {
-    float shift = maxOut - MOTOR_MAX_LIMIT;
-    m1 -= shift; m2 -= shift; m3 -= shift; m4 -= shift;
+  // saturation protection (shift down)
+  float maxOut = fmaxf(fmaxf(m1,m2), fmaxf(m3,m4));
+  if(maxOut > MOTOR_MAX_LIMIT){
+    float s = maxOut - MOTOR_MAX_LIMIT;
+    m1-=s; m2-=s; m3-=s; m4-=s;
   }
 
+  // clamp
   m1 = clampf(m1, 0, PWM_MAX);
   m2 = clampf(m2, 0, PWM_MAX);
   m3 = clampf(m3, 0, PWM_MAX);
   m4 = clampf(m4, 0, PWM_MAX);
 
-  if (!armed || killSwitch) {
-    allMotorsOff();
-  } else {
+  if(!armed){
+    motorsOff();
+  }else{
     motorWrite(CH_M1, (int)m1);
     motorWrite(CH_M2, (int)m2);
     motorWrite(CH_M3, (int)m3);
     motorWrite(CH_M4, (int)m4);
-  }
-
-  // Debug (optional)
-  static uint32_t dbgMs = 0;
-  if (nowMs - dbgMs > 250) {
-    dbgMs = nowMs;
-    char buf[80];
-    snprintf(buf, sizeof(buf), "ARM:%d MODE:%c R:%.1f P:%.1f STA:%d",
-             armed ? 1 : 0, (mode == MODE_ANGLE) ? 'A' : 'R',
-             roll_deg, pitch_deg, WiFi.softAPgetStationNum());
-    ws.textAll(buf);
   }
 }

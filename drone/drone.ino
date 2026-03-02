@@ -1,15 +1,17 @@
 /*
   LiteWing App - Ready To Fly (Brushed) | ESP32-C3 SuperMini Plus + MPU6050
   FIXED for:
-   - Right side weak (M2 + M3) => boost those motors
+   - Right side weak (M2 + M3) motor trim (now balanced)
    - Instant stop on throttle release (NO 2s delay)
    - No boot motor blip (force pins LOW before PWM attach)
    - LED status on GPIO8 (boot blink, wifi ready solid)
+   - Yaw drift trim (clockwise drift fix)
+   - M1 start earlier (fix late start)
 
   PINS:
     M1 GPIO21 Front Left
-    M2 GPIO20 Front Right  (RIGHT)
-    M3 GPIO10 Back  Right  (RIGHT)
+    M2 GPIO20 Front Right
+    M3 GPIO10 Back  Right
     M4 GPIO5  Back  Left
     MPU6050: SCL GPIO6, SDA GPIO7
     LED: GPIO8
@@ -24,8 +26,8 @@
 
 // =================== PINS ===================
 static const int PIN_M1 = 21;   // FL
-static const int PIN_M2 = 20;   // FR (RIGHT)
-static const int PIN_M3 = 10;   // BR (RIGHT)
+static const int PIN_M2 = 20;   // FR
+static const int PIN_M3 = 10;   // BR
 static const int PIN_M4 = 5;    // BL
 static const int I2C_SCL = 6;
 static const int I2C_SDA = 7;
@@ -50,11 +52,14 @@ static const int CH_M2 = 1;
 static const int CH_M3 = 2;
 static const int CH_M4 = 3;
 
-// =================== MOTOR FIX (RIGHT SIDE WEAK M2/M3) ===================
-// Per-motor start threshold + gain (RIGHT side boosted)
-static int motorMin[4]      = {35, 48, 48, 35};             // M2/M3 start earlier
-static float motorGain[4]   = {1.00f, 1.20f, 1.20f, 1.00f}; // M2/M3 stronger
-static const int MOTOR_MAX_LIMIT = 240;                     // headroom
+// =================== MOTOR TRIM (UPDATED) ===================
+// Updated based on your feedback:
+// - Right side became too strong => reduce M2/M3 gain
+// - M1 starts late (>20%) => lower M1 min + slightly boost M1 gain
+static int motorMin[4]      = {30, 42, 42, 35};              // M1,M2,M3,M4
+static float motorGain[4]   = {1.12f, 1.12f, 1.12f, 1.00f};  // closer balance
+
+static const int MOTOR_MAX_LIMIT = 240; // headroom
 
 // =================== CONTROL LOOP ===================
 static const uint32_t LOOP_US = 4000;     // 250Hz
@@ -62,8 +67,8 @@ static const float CF_ALPHA = 0.98f;
 
 // SAFETY / INSTANT STOP
 static const float THR_ON_ARM   = 0.08f;  // need >8% thrust to arm
-static const float THR_OFF_STOP = 0.02f;  // <2% => instant stop
-static const uint32_t FAILSAFE_MS = 220;  // faster failsafe (packet lost)
+static const float THR_OFF_STOP = 0.02f;  // <2% => instant stop (no delay)
+static const uint32_t FAILSAFE_MS = 220;  // faster failsafe
 
 // =================== FLIGHT MODE ===================
 enum FlightMode { MODE_ANGLE = 0, MODE_RATE = 1 };
@@ -84,6 +89,10 @@ WiFiUDP udp;
 
 static float roll_deg = 0, pitch_deg = 0;
 static float rollTrim = 0.0f, pitchTrim = 0.0f;
+
+// Yaw trim: If body drifts CLOCKWISE, yawTrim should be POSITIVE.
+// Start with +12; adjust +5/-5 as needed.
+static float yawTrim = 12.0f;
 
 static float gbx=0, gby=0, gbz=0;   // gyro bias rad/s
 
@@ -147,7 +156,6 @@ static void calibrateGyro(uint16_t samples=900){
 }
 
 static void calibrateLevelTrim(){
-  // estimate level roll/pitch average while flat, disarmed
   float sr=0, sp=0;
   const int N=160;
   for(int i=0;i<N;i++){
@@ -161,7 +169,6 @@ static void calibrateLevelTrim(){
     float accPitch = atan2f(-a.acceleration.x,
                             sqrtf(a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z)) * 180.0f / PI;
 
-    // update filter quickly
     roll_deg  = CF_ALPHA*(roll_deg  + gx*0.004f) + (1.0f-CF_ALPHA)*accRoll;
     pitch_deg = CF_ALPHA*(pitch_deg + gy*0.004f) + (1.0f-CF_ALPHA)*accPitch;
 
@@ -226,7 +233,7 @@ void setup(){
   Serial.begin(115200);
   delay(120);
 
-  forcePinsLowBeforePWM();   // <<< boot blip fix
+  forcePinsLowBeforePWM();
 
   // IMU
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -380,7 +387,7 @@ void loop(){
 
   // yaw reverse if needed
   const float yawSign = 1.0f;
-  float yawTerm = yawSign * out_y;
+  float yawTerm = yawSign * (out_y + yawTrim);  // <<< yaw drift fix
 
   // Mix (X): M1 FL, M2 FR, M3 BR, M4 BL
   float m[4];
